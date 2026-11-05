@@ -1,0 +1,17 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+
+# Arduino build output
+build/
+*.bin
+*.elf
+*.map
+
+# Secrets / local config
+.env
+secrets.h
