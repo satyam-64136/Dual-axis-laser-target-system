@@ -10,7 +10,7 @@ An ESP32 pan-tilt turret that points a laser dot at a colored target, controlled
 - **AUTO mode:** scans left and right, tracks the target, then locks on after 1 second.
 - **Live HUD:** lock-on brackets, a radar of the aim point, lock counter, and sound cues.
 - **Zero-config WiFi:** the ESP32 creates its own network, so there are no passwords to edit.
-- **Live object detector:** boxes and labels for people, bottles, cups, phones, laptops and more.
+- **Live object detector:** stable, smoothed boxes with labels for people, bottles, cups, phones, laptops and more.
 
 ## Hardware
 

@@ -12,7 +12,8 @@ body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-seri
 video,canvas{position:absolute;inset:0;width:100%;height:100%}
 video.mirror{transform:scaleX(-1)}
 #load{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#000c;font-weight:700;text-align:center;padding:20px}
-.row{display:flex;gap:8px;margin:8px 0;align-items:center}
+.row{display:flex;gap:8px;margin:8px 0;align-items:center;flex-wrap:wrap}
+select{padding:12px 10px;border:0;border-radius:10px;background:var(--card);color:var(--fg);font-weight:700}
 button{padding:12px 14px;border:0;border-radius:10px;background:var(--card);color:var(--fg);font-weight:700}
 .card{background:var(--card);border-radius:12px;padding:8px 12px;flex:1;display:flex;align-items:center;gap:8px;color:var(--mut)}
 input[type=range]{flex:1}
@@ -29,7 +30,8 @@ input[type=range]{flex:1}
 </div>
 <div class="row">
   <button id="sw">Switch camera</button>
-  <div class="card">Min <input type="range" id="th" min="0.5" max="0.95" step="0.05" value="0.55"><span id="tv">55%</span></div>
+  <select id="md"><option value="mobilenet_v2">Accurate</option><option value="lite_mobilenet_v2">Fast</option></select>
+  <div class="card">Min <input type="range" id="th" min="0.3" max="0.9" step="0.05" value="0.5"><span id="tv">50%</span></div>
   <div id="fps">-- FPS</div>
 </div>
 <div id="cnt"></div>
@@ -73,54 +75,150 @@ $('sw').onclick = async () => {
 };
 $('th').oninput = () => { $('tv').textContent = Math.round($('th').value * 100) + '%'; };
 
-function draw(preds) {
+/* ===== TRACKER: smooths boxes, stops flicker, stabilizes labels ===== */
+const MIN_DET = 0.30, MIN_AREA = 0.0015, MAX_MISS = 6, HYST = 0.15;
+let tracks = [], nextId = 1;
+
+function iou(a, b) {
+  const x1 = Math.max(a[0], b[0]), y1 = Math.max(a[1], b[1]);
+  const x2 = Math.min(a[0] + a[2], b[0] + b[2]), y2 = Math.min(a[1] + a[3], b[1] + b[3]);
+  const i = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  const u = a[2] * a[3] + b[2] * b[3] - i;
+  return u > 0 ? i / u : 0;
+}
+
+function nms(dets, thr) {
+  dets.sort((a, b) => b.score - a.score);
+  const out = [];
+  for (const d of dets) if (out.every(k => iou(k.bbox, d.bbox) < thr)) out.push(d);
+  return out;
+}
+
+function bestClass(votes) {
+  let best = null, bv = -1;
+  for (const c in votes) if (votes[c] > bv) { bv = votes[c]; best = c; }
+  return best;
+}
+
+function updateTracks(dets, now, vw, vh, thr) {
+  dets = nms(dets.filter(d => d.bbox[2] * d.bbox[3] >= MIN_AREA * vw * vh), 0.6);
+  for (const t of tracks) {
+    const dt = Math.min(200, now - t.t);
+    t.pred = [t.box[0] + t.vx * dt, t.box[1] + t.vy * dt, t.box[2], t.box[3]];
+  }
+  const pairs = [];
+  tracks.forEach((t, i) => dets.forEach((d, j) => {
+    const o = iou(t.pred, d.bbox);
+    if (o >= (t.cls === d.class ? 0.2 : 0.5)) pairs.push([o, i, j]);
+  }));
+  pairs.sort((a, b) => b[0] - a[0]);
+  const usedT = new Set(), usedD = new Set();
+  for (const [, i, j] of pairs) {
+    if (usedT.has(i) || usedD.has(j)) continue;
+    usedT.add(i); usedD.add(j);
+    const t = tracks[i], d = dets[j];
+    const dt = Math.min(200, Math.max(1, now - t.t));
+    const mv = Math.max(Math.abs(d.bbox[0] - t.pred[0]), Math.abs(d.bbox[1] - t.pred[1])) / Math.max(t.box[2], t.box[3]);
+    const A = mv < 0.07 ? 0.25 : mv < 0.15 ? 0.5 : 0.8;   // calm = heavy smoothing, fast motion = follow quickly
+    const nb = t.pred.map((p, k) => p + A * (d.bbox[k] - p));
+    const calm = mv < 0.07;                                 // no motion prediction when basically still
+    t.vx = calm ? 0 : 0.7 * t.vx + 0.3 * (nb[0] - t.box[0]) / dt;
+    t.vy = calm ? 0 : 0.7 * t.vy + 0.3 * (nb[1] - t.box[1]) / dt;
+    t.box = nb; t.t = now;
+    t.score = 0.6 * t.score + 0.4 * d.score;
+    for (const c in t.votes) t.votes[c] *= 0.9;
+    t.votes[d.class] = (t.votes[d.class] || 0) + d.score;
+    t.cls = bestClass(t.votes);
+    t.hits++; t.miss = 0;
+  }
+  tracks.forEach((t, i) => {
+    if (usedT.has(i)) return;
+    t.miss++; t.box = t.pred; t.vx *= 0.7; t.vy *= 0.7; t.score *= 0.92; t.t = now;
+  });
+  tracks = tracks.filter(t => t.miss <= MAX_MISS && !(t.hits < 3 && t.miss > 1));
+  dets.forEach((d, j) => {
+    if (usedD.has(j) || d.score < 0.4) return;
+    tracks.push({ id: nextId++, box: d.bbox.slice(), disp: d.bbox.slice(), vx: 0, vy: 0,
+      score: d.score, hits: 1, miss: 0, votes: { [d.class]: d.score }, cls: d.class, shown: false, t: now });
+  });
+  for (const t of tracks) {
+    if (!t.shown) {
+      if ((t.hits >= 3 && t.score >= thr) || (t.hits >= 2 && t.score >= Math.max(thr, 0.75))) t.shown = true;
+    } else if (t.score < thr - HYST || t.miss > 4) t.shown = false;
+  }
+}
+
+function stepDisplay(k) {
+  for (const t of tracks) for (let i = 0; i < 4; i++) t.disp[i] += k * (t.box[i] - t.disp[i]);
+}
+
+/* ===== RENDER (smooth, every frame) and DETECT (slower, in background) ===== */
+let lastChips = '';
+function render() {
   const vw = v.videoWidth, vh = v.videoHeight;
-  if (o.width !== vw || o.height !== vh) { o.width = vw; o.height = vh; $('box').style.aspectRatio = vw + '/' + vh; }
-  g.clearRect(0, 0, vw, vh);
-  const mirror = facing === 'user', thr = +$('th').value, s = vw / 640;
-  const counts = {};
-  g.font = 'bold ' + Math.round(15 * s) + 'px system-ui,sans-serif';
-  g.textBaseline = 'middle';
-  for (const p of preds) {
-    if (p.score < thr) continue;
-    let [x, y, w, h] = p.bbox;
-    if (mirror) x = vw - x - w;
-    const col = colorOf(p.class);
-    counts[p.class] = (counts[p.class] || 0) + 1;
-    g.lineWidth = 3 * s; g.strokeStyle = col;
-    g.strokeRect(x, y, w, h);
-    const label = p.class + ' ' + Math.round(p.score * 100) + '%';
-    const tw = g.measureText(label).width + 12 * s, th = 22 * s;
-    const ty = y - th < 0 ? y : y - th;
-    g.fillStyle = col; g.fillRect(x, ty, tw, th);
-    g.fillStyle = '#04110b'; g.fillText(label, x + 6 * s, ty + th / 2);
+  if (vw) {
+    if (o.width !== vw || o.height !== vh) { o.width = vw; o.height = vh; $('box').style.aspectRatio = vw + '/' + vh; }
+    g.clearRect(0, 0, vw, vh);
+    stepDisplay(0.4);
+    const mirror = facing === 'user', s = vw / 640, counts = {};
+    g.font = 'bold ' + Math.round(15 * s) + 'px system-ui,sans-serif';
+    g.textBaseline = 'middle';
+    for (const t of tracks) {
+      if (!t.shown) continue;
+      let [x, y, w, h] = t.disp;
+      if (mirror) x = vw - x - w;
+      const col = colorOf(t.cls);
+      counts[t.cls] = (counts[t.cls] || 0) + 1;
+      g.globalAlpha = t.miss > 0 ? 0.55 : 1;
+      g.lineWidth = 3 * s; g.strokeStyle = col;
+      g.strokeRect(x, y, w, h);
+      const label = t.cls + ' ' + Math.round(t.score * 100) + '%';
+      const tw = g.measureText(label).width + 12 * s, th = 22 * s;
+      const ty = y - th < 0 ? y : y - th;
+      g.fillStyle = col; g.fillRect(x, ty, tw, th);
+      g.fillStyle = '#04110b'; g.fillText(label, x + 6 * s, ty + th / 2);
+    }
+    g.globalAlpha = 1;
+    const chips = Object.entries(counts)
+      .map(([k, n]) => '<span class="chip" style="background:' + colorOf(k) + '">' + k + ' x' + n + '</span>').join('');
+    if (chips !== lastChips) { $('cnt').innerHTML = chips; lastChips = chips; }
   }
-  $('cnt').innerHTML = Object.entries(counts)
-    .map(([k, n]) => '<span class="chip" style="background:' + colorOf(k) + '">' + k + ' x' + n + '</span>').join('');
+  requestAnimationFrame(render);
 }
 
-async function loop() {
-  if (model && v.readyState >= 2 && v.videoWidth) {
-    const preds = await model.detect(v, 20);
-    draw(preds);
-    const now = performance.now();
-    fps = fps * 0.8 + (1000 / (now - last)) * 0.2; last = now;
-    $('fps').textContent = fps.toFixed(0) + ' FPS';
+async function detectLoop() {
+  while (true) {
+    if (model && v.readyState >= 2 && v.videoWidth) {
+      const preds = await model.detect(v, 30, MIN_DET);
+      const now = performance.now();
+      updateTracks(preds, now, v.videoWidth, v.videoHeight, +$('th').value);
+      fps = fps * 0.8 + (1000 / (now - last)) * 0.2; last = now;
+      $('fps').textContent = fps.toFixed(0) + ' FPS';
+    }
+    await new Promise(r => requestAnimationFrame(r));
   }
-  requestAnimationFrame(loop);
 }
 
-(async () => {
-  const ok = await startCamera();
-  if (!ok) return;
+async function loadModel(base) {
+  load.style.display = 'flex';
+  load.innerHTML = 'Loading AI model...<br>(needs internet, first load only)';
+  model = null; tracks = [];
   try {
-    model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+    model = await cocoSsd.load({ base });
   } catch (e) {
     load.textContent = 'Could not load the model. Check your internet connection.';
     return;
   }
   load.style.display = 'none';
-  loop();
+}
+$('md').onchange = () => loadModel($('md').value);
+
+(async () => {
+  const ok = await startCamera();
+  if (!ok) return;
+  render();
+  detectLoop();
+  await loadModel($('md').value);
 })();
 </script>
 </body>
